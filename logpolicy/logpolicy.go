@@ -35,6 +35,7 @@ import (
 	"tailscale.com/paths"
 	"tailscale.com/smallzstd"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/racebuild"
 	"tailscale.com/version"
 )
 
@@ -315,6 +316,9 @@ func New(collection string) *Policy {
 	} else {
 		lflags = log.LstdFlags
 	}
+	if v, _ := strconv.ParseBool(os.Getenv("TS_DEBUG_LOG_TIME")); v {
+		lflags = log.LstdFlags | log.Lmicroseconds
+	}
 	if runningUnderSystemd() {
 		// If journalctl is going to prepend its own timestamp
 		// anyway, no need to add one.
@@ -356,7 +360,7 @@ func New(collection string) *Policy {
 		newc.PrivateID = logtail.PrivateID{}
 		newc.Collection = collection
 	}
-	if newc.PrivateID == (logtail.PrivateID{}) {
+	if newc.PrivateID.IsZero() {
 		newc.PrivateID, err = logtail.NewPrivateID()
 		if err != nil {
 			log.Fatalf("logpolicy: NewPrivateID() should never fail")
@@ -392,8 +396,8 @@ func New(collection string) *Policy {
 	log.SetOutput(lw)
 
 	log.Printf("Program starting: v%v, Go %v: %#v",
-		version.LONG,
-		strings.TrimPrefix(runtime.Version(), "go"),
+		version.Long,
+		goVersion(),
 		os.Args)
 	log.Printf("LogID: %v", newc.PublicID)
 	if filchErr != nil {
@@ -475,4 +479,12 @@ func newLogtailTransport(host string) *http.Transport {
 	tr.TLSClientConfig = tlsdial.Config(host, tr.TLSClientConfig)
 
 	return tr
+}
+
+func goVersion() string {
+	v := strings.TrimPrefix(runtime.Version(), "go")
+	if racebuild.On {
+		return v + "-race"
+	}
+	return v
 }

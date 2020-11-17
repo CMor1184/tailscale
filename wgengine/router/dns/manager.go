@@ -10,12 +10,18 @@ import (
 	"tailscale.com/types/logger"
 )
 
+// We use file-ignore below instead of ignore because on some platforms,
+// the lint exception is necessary and on others it is not,
+// and plain ignore complains if the exception is unnecessary.
+
+//lint:file-ignore U1000 reconfigTimeout is used on some platforms but not others
+
 // reconfigTimeout is the time interval within which Manager.{Up,Down} should complete.
 //
 // This is particularly useful because certain conditions can cause indefinite hangs
 // (such as improper dbus auth followed by contextless dbus.Object.Call).
 // Such operations should be wrapped in a timeout context.
-const reconfigTimeout = time.Second //lint:ignore U1000 used on Linux at least, maybe others later
+const reconfigTimeout = time.Second
 
 type managerImpl interface {
 	// Up updates system DNS settings to match the given configuration.

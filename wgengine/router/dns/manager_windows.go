@@ -5,11 +5,14 @@
 package dns
 
 import (
-	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/tailscale/wireguard-go/tun"
+	wgregistry "github.com/tailscale/wireguard-go/tun/wintun/registry"
 	"golang.org/x/sys/windows/registry"
 	"tailscale.com/types/logger"
 )
@@ -32,8 +35,14 @@ func newManager(mconfig ManagerConfig) managerImpl {
 	}
 }
 
+// keyOpenTimeout is how long we wait for a registry key to
+// appear. For some reason, registry keys tied to ephemeral interfaces
+// can take a long while to appear after interface creation, and we
+// can end up racing with that.
+const keyOpenTimeout = time.Minute
+
 func setRegistryString(path, name, value string) error {
-	key, err := registry.OpenKey(registry.LOCAL_MACHINE, path, registry.SET_VALUE)
+	key, err := wgregistry.OpenKeyWait(registry.LOCAL_MACHINE, path, registry.SET_VALUE, keyOpenTimeout)
 	if err != nil {
 		return fmt.Errorf("opening %s: %w", path, err)
 	}
@@ -46,68 +55,16 @@ func setRegistryString(path, name, value string) error {
 	return nil
 }
 
-func getRegistryString(path, name string) (string, error) {
-	key, err := registry.OpenKey(registry.LOCAL_MACHINE, path, registry.READ)
-	if err != nil {
-		return "", fmt.Errorf("opening %s: %w", path, err)
-	}
-	defer key.Close()
-
-	value, _, err := key.GetStringValue(name)
-	if err != nil {
-		return "", fmt.Errorf("getting %s[%s]: %w", path, name, err)
-	}
-	return value, nil
-}
-
 func (m windowsManager) setNameservers(basePath string, nameservers []string) error {
 	path := fmt.Sprintf(`%s\Interfaces\%s`, basePath, m.guid)
 	value := strings.Join(nameservers, ",")
 	return setRegistryString(path, "NameServer", value)
 }
 
-func (m windowsManager) setDomains(path string, oldDomains, newDomains []string) error {
-	// We reimplement setRegistryString to ensure that we hold the key for the whole operation.
-	key, err := registry.OpenKey(registry.LOCAL_MACHINE, path, registry.READ|registry.SET_VALUE)
-	if err != nil {
-		return fmt.Errorf("opening %s: %w", path, err)
-	}
-	defer key.Close()
-
-	searchList, _, err := key.GetStringValue("SearchList")
-	if err != nil && err != registry.ErrNotExist {
-		return fmt.Errorf("getting %s[SearchList]: %w", path, err)
-	}
-	currentDomains := strings.Split(searchList, ",")
-
-	var domainsToSet []string
-	for _, domain := range currentDomains {
-		inOld, inNew := false, false
-
-		// The number of domains should be small,
-		// so this is probaly faster than constructing a map.
-		for _, oldDomain := range oldDomains {
-			if domain == oldDomain {
-				inOld = true
-			}
-		}
-		for _, newDomain := range newDomains {
-			if domain == newDomain {
-				inNew = true
-			}
-		}
-
-		if !inNew && !inOld {
-			domainsToSet = append(domainsToSet, domain)
-		}
-	}
-	domainsToSet = append(domainsToSet, newDomains...)
-
-	searchList = strings.Join(domainsToSet, ",")
-	if err := key.SetStringValue("SearchList", searchList); err != nil {
-		return fmt.Errorf("setting %s[SearchList]: %w", path, err)
-	}
-	return nil
+func (m windowsManager) setDomains(basePath string, domains []string) error {
+	path := fmt.Sprintf(`%s\Interfaces\%s`, basePath, m.guid)
+	value := strings.Join(domains, ",")
+	return setRegistryString(path, "SearchList", value)
 }
 
 func (m windowsManager) Up(config Config) error {
@@ -122,23 +79,17 @@ func (m windowsManager) Up(config Config) error {
 		}
 	}
 
-	lastSearchList, err := getRegistryString(tsRegBase, "SearchList")
-	if err != nil && !errors.Is(err, registry.ErrNotExist) {
-		return err
-	}
-	lastDomains := strings.Split(lastSearchList, ",")
-
 	if err := m.setNameservers(ipv4RegBase, ipsv4); err != nil {
 		return err
 	}
-	if err := m.setDomains(ipv4RegBase, lastDomains, config.Domains); err != nil {
+	if err := m.setDomains(ipv4RegBase, config.Domains); err != nil {
 		return err
 	}
 
 	if err := m.setNameservers(ipv6RegBase, ipsv6); err != nil {
 		return err
 	}
-	if err := m.setDomains(ipv6RegBase, lastDomains, config.Domains); err != nil {
+	if err := m.setDomains(ipv6RegBase, config.Domains); err != nil {
 		return err
 	}
 
@@ -146,6 +97,26 @@ func (m windowsManager) Up(config Config) error {
 	if err := setRegistryString(tsRegBase, "SearchList", newSearchList); err != nil {
 		return err
 	}
+
+	// Force DNS re-registration in Active Directory. What we actually
+	// care about is that this command invokes the undocumented hidden
+	// function that forces Windows to notice that adapter settings
+	// have changed, which makes the DNS settings actually take
+	// effect.
+	//
+	// This command can take a few seconds to run, so run it async, best effort.
+	go func() {
+		t0 := time.Now()
+		m.logf("running ipconfig /registerdns ...")
+		cmd := exec.Command("ipconfig", "/registerdns")
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		d := time.Since(t0).Round(time.Millisecond)
+		if err := cmd.Run(); err != nil {
+			m.logf("error running ipconfig /registerdns after %v: %v", d, err)
+		} else {
+			m.logf("ran ipconfig /registerdns in %v", d)
+		}
+	}()
 
 	return nil
 }
